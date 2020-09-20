@@ -1,0 +1,89 @@
+#define ADC_MAX_CHANNELS      4
+#define ADC_MAX_BUFFER     2000
+#define ADC_SAMPLE_LENGTH   100
+
+typedef struct{
+  uint8_t    mux;    // конфигурация пинов канала
+  uint8_t    pinPos; // номер входа для простого или "+" для диф. режима
+  uint8_t    pinNeg; // вход для "-" в диф. режиме, иначе не исп.
+} AdcChannel;
+
+AdcChannel   channel[ADC_MAX_CHANNELS];
+
+uint8_t      adcBuffer[ADC_MAX_BUFFER]; /** единый общий буфер замеров              */
+uint8_t      adcChannels;               /** сколько сейчас каналов                  */
+uint8_t      adcLevel;                  /** уровень синхронизации в попугаях АЦП    */
+uint8_t      adcSign;                   /** boolean: 0->"+", 1->"-"                 */
+uint8_t      adcSampleLength;           /** длина 1 образца в буфере на любой канал */
+uint8_t      adcSource;                 /** источник опорного напряжения - един!    */
+
+/** Wait for end current measure */
+#define adcWait1() {while(ADCSRA&_BV(ADIF));}
+/** Get result from ADCH */
+#define adcRead1(p) {adcWait1(); (p)=ADCH;}
+
+/**
+ * Fill measures buffer for all channels with presetted channel data, sinhro-level, etc.
+ * Before: ADC must be set into free running mode!
+ */
+void adcMeasure()
+{
+  // register:
+  uint8_t      _numChannel = adcChannels;
+  AdcChannel * _ptrChannel = &adcChannel[0];
+  uint8_t *    _buf        = &adcBuffer[0];
+  uint8_t      _samples    = ADC_MAX_BUFFER / ADC_SAMPLE_LENGTH;
+  uint8_t      _level      = adcLevel;
+  uint8_t      _sign       = adcSign;
+  uint8_t      _isSign     = 0;
+  uint8_t      _source     = adcSource;
+  uint8_t      _shift      = adcShift;
+  uint8_t      _adc;
+
+  do{
+    uint8_t      _measures   = ADC_SAMPLE_LENGTH;
+
+    // 0. Prepare ADMUX for channel[0] - skip to end current measure for setting:
+    ADMUX |= _BV(ADLAR) | _source | _ptrChannel->mux;
+
+    // 1. search sinhrolevel:
+    switch(_sign){
+    case 0: /*to positive */
+      do{
+_POS_LEVEL:
+        adcRead1(_adc);
+        if( _adc < _level ){ _isSign = 1; goto _POS_LEVEL; }
+      }while( _isSign == 0 );
+      break;
+    case 1: /* to negative */
+      do{
+_NEG_LEVEL:
+        adcRead1(_adc);
+        if( _adc > _level ){ _isSign = 1; goto _NEG_LEVEL; }
+      }while( _isSign == 0 );
+      break;
+    }
+
+    // 2. Make shift for next sample if need:
+    if( _shift > 0 ){ delayMicro16(_shift); }
+
+    // 3. start measure for 1 sample:
+    do{
+      do{
+        // 2.1 prepare next measure before read!
+        if( --_numChannel > 0 ){ _ptrChannel++;            }
+        else                   { _ptrChannel = adcChannel; }
+        ADMUX |= _BV(ADLAR) | _source | _ptrChannel->mux;
+
+        adcRead1(_adc);
+        *_buf++ = _adc;
+      }while( _numChannel > 0 );
+    }while(--_measures > 0 );
+  }while( --samples>0 );
+}
+
+void setup() {
+}
+
+void loop() {
+}

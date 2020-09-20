@@ -1,0 +1,404 @@
+/**
+ * TWI (I2C)
+ *
+ *
+ * @author Arhat109: arhat109@mail.ru
+ *
+ * license agreement:
+ * You use this software on own your risks. No claims will be accepted.
+ * You may use this file any way, but cannot change
+ * or delete tag @author above (you may append your tag @author) and must keeping this rows:
+ *
+ * This is free software, not any pay. But you may donate some money to phone +7-951-388-2793
+ */
+
+// TWI (I2C) register description:
+// ===============================
+// TWBR -- TWI bit rate register 0..7
+// TWCR -- TWI control register: TWINT : TWEA : TWSTA : TWSTO : TWWC : TWEN : - : TWIE
+//  + TWINT - прерывание. Не очищается железом! SCL=0 пока установлен! Только ручками (записать 1) и после записи в регистры адреса/данных! Сразу начнется передача.
+//  + TWEA  - разрешает(1) генерацию подтверждений для: это мой slave адрес; пришел вызов "всем" и TWGCE=1; пришел байт данных (M/S recieve modes)
+//  + TWSTA - =1: Я - Мастер, начать передачу, если свободно, иначе ждать пока занято. Зачищать программно.
+//  + TWSTO - =1: Я - Мастер, отправить STOP-условие в шину. Сам сбросится когда закончит.
+//  + TWWC  - автоустановка в 1, при попытках писать в TWDR при TWINT=0. Автосброс при записи в TWDR при TWINT=1
+//  + TWEN  - =1: разрешение пинов SCL,SDA на вывод тут. =0 сбрасывает все передачи и состояния: "выключен".
+//  + TWIE  - =1: разрешено прерывание от TWI (если ваще разрешены!)
+// TWSR -- TWI status register: TWS7..3 : - : TWPS1 : TWPS0
+//  + TWPS1, TWPS0 - доп. делитель частоты: 1,1/4,1/16,1/64
+//  + TWS7..3      - статус интерфейса.
+// TWDR -- TWI регистр данных прием/передача доступен только при TWINT=1. Не определен для TWINT=1 из wakeup mode.
+// TWAR -- TWI slave регистр адреса: TWAR7..1 (7бит!) : TWGCE
+//  + TWGCE - обнаруживать адрес "всем" (0х00).
+// TWAMR -- регистр маски адресов. Каждый бит регистра адреса может маскироваться отдельно.
+//
+// F_SCL = (F_CPU)/(16+2*TWBR*(1<<(2*TWPS)))
+
+#include "arhat.h"
+
+/**
+ * only:
+ * TW_xx_xxxx status macro definitions -- overnamed this!
+ * TW_READ,TW_WRITE for slar/slaw address
+ * TW_STATUS_MASK, TW_STATUS macro for get TWI status register
+ */
+#include <util/twi.h>
+
+// ATMEGA2560
+#define pinSDA          20
+#define pinSCL          21
+
+#define TWI_MASTER_START        0x08    // Мастер: отправил начало связи. Шина моя.
+#define TWI_MASTER_NEXT         0x10    // Мастер: отправил повтор адреса (смена режима, повтор)
+#define TWI_LOST                0x38    // Потеря связи этим мастером .. кто-то вылез ишо.
+#define TWI_LOST_FORME_LISTEN   0x68    // Потеря связи как мастер, получен мой адрес, слушаю (ACK)
+#define TWI_LOST_FORALL_LISTEN  0x78    // Потеря связи как мастер, получен адрес "всем", слушаю (ACK)
+#define TWI_LOST_FORME_ASK      0xB0    // Потеря связи как мастер, получен мой адрес, ща как свистну! (ACK)
+
+#define TWI_SLAW_OK             0x18    // Адресат есть и готов к приему (ACK)
+#define TWI_SLAW_ERR            0x20    // Ой, адресата нет или он не готов к приему! (NOT_ACK)
+#define TWI_MASTER_WRITE_OK     0x28    // Данные от мастера получены успешно
+#define TWI_MASTER_WRITE_ERR    0x30    // оттуда: "Мастер, я нифига не понял.." (NOT_ACK)
+
+#define TWI_SLAR_OK             0x40    // Адресат есть и готов к передаче (ACK)
+#define TWI_SLAR_ERR            0x48    // Ой, адресата нет или он не готов к передаче (NOT_ACK)
+#define TWI_MASTER_READ_OK      0x50    // Данные пришли, свистну ОК (ACK)
+#define TWI_MASTER_READ_ERR     0x58    // Мастер: "Эй, ты чего прислал?" (NOT_ACK)
+
+#define TWI_FORME_LISTEN        0x60    // ведомый: обнаружен мой адрес, слушаю (отправляю ACK)
+#define TWI_FORME_READ_OK       0x80    // ведомый: получил байт данных (отправляю ACK)
+#define TWI_FORME_READ_ERR      0x88    // ведомый: "пришел кривой байт" (отправляю NOT_ACK)
+
+#define TWI_FORALL_LISTEN       0x70    // ведомый: адрес "всем", готов слушать (отправляю ACK)
+#define TWI_FORALL_READ_OK      0x90    // ведомый: получил байт для всех (отправляю ACK)
+#define TWI_FORALL_READ_ERR     0x98    // ведомый: "пришел кривой байт всем" (отправляю NOT_ACK)
+
+#define TWI_FORME_ASK           0xA8    // ведомый: обнаружен мой адрес, спрашивают (отправляю ACK)
+#define TWI_FORME_ANSWER        0xB8    // ведомый: свистнул, меня услышали (получил ACK)
+#define TWI_FORME_ANSWER_ERR    0xC0    // ведомый: передал, меня не поняли (получил NOT_ACK)
+
+#define TWI_FORME_ANSWER_LAST   0xC8    // ведомый: (если TWEA=0) это последний байт, меня услышали (получил ACK)
+#define TWI_STOP                0xA0    // Мастер: конец передачи; ведомый: был на связи (адресат или всем), получил конец передачи (отправляю ACK)
+#define TWI_EMPTY               0xF8    // статус нерелевантен - ничем не занят
+#define TWI_ERROR               0x00    // ошибка формата протокола связи .. чё попало.
+
+#define TWI_MAX_REPEATS         3               // Максимальное количество повторов отправки, которое будет делать передатчик (master|slave) в случае NACK
+
+#define TWI_STATE_OK            0               // Сеанс работы завершен успешно
+#define TWI_STATE_LOST          TWI_LOST        // Ошибка: "Меня заткнули"
+#define TWI_STATE_MTXRX         1               // пуск в режиме "Я - мастер, пишу и потом читаю"
+#define TWI_STATE_NOTSLA        2               // адрес собеседника не распознан: молчит зараза..
+#define TWI_STATE_ERRDATA       3               // получен NACK при обмене данными, передача завершена TWI_MAX_REPEAT раз с этим состоянием
+#define TWI_STATE_LISTEN        4               // режим слушания шины слейвом
+
+uint8_t twi_setSpeed(uint32_t freq);
+uint8_t twi_init( uint32_t f, uint8_t ack);
+
+/**
+ * Internal pullup pins and set TWI speed f:[491..888_889]hz for F_CPU=16Mhz
+ * Warning! Not control for speed. If < 491hz - speed not be setted!
+ * set TWI on. TWI: pin, int, ack - enabled. for setup(), not started!
+ */
+#define twi_on()     \
+{                    \
+  PRR0 &= CLR_MASK7; \
+  TWCR |= _BV(TWEN); \
+}
+
+/**
+ * TWI is off, TWI_INT disable and reduce power too.
+ */
+#define twi_off()                 \
+{                                 \
+  TWCR &= ~(_BV(TWEN)|_BV(TWIE)); \
+  PRR0 |= SET_MASK7;              \
+}
+
+#define twi_getState()          (TW_STATUS)                     // get state TWI state controller
+#define twi_getAddress()        (TWAR>>1)                       // get my own address (7 bit only!)
+#define twi_setAddress(adr)     (TWAR |= ((uint8_t)adr)<<1)     // set my own address without global bit change
+#define twi_is_gce()            (TWAR & SET_MASK0)              // return TWGCE (Global Call Enable) bit
+#define twi_set_gce()           (TWAR |= TWGCE)                 // set Global Call as Enable
+#define twi_clr_gce()           (TWAR &= ~TWGCE)                // disable Global Calls
+
+#define twi_setSLA(adr, rw)     (twi_slarw = ((adr)<<1)|(rw))   // set destination address and mode [TW_READ|TW_WRITE]
+#define twi_go()                (TWCR = (_BV(TWINT))|(twi_isSlave?(_BV(TWEA):0))|(_BV(TWEN))|(_BV(TWIE)))
+#define twi_goACK()             (TWCR = (_BV(TWINT))|(_BV(TWEA))|(_BV(TWEN))|(_BV(TWIE)))
+#define twi_goNACK()            (TWCR = (_BV(TWINT))|(_BV(TWEN))|(_BV(TWIE)))
+
+/**
+ * start transmiting: send start condition
+ * @param sla -- [0..127] адрес устройства, с кем работаем в качестве мастера
+ * @param rw  -- [TW_READ | TW_WRITE] режим мастера: "Master Transmitter mode" | "Master Resiever mode"
+ *
+ * Сразу начинается захват интерфейса:
+ * @return global twi_master=TWI_LOST если шина занята.
+ */
+#define twi_sendStart(sla, rw)         \
+{                                      \
+    twi_slarw = ((sla)<<1) | (rw);     \
+    TWCR |= (_BV(TWINT) | _BV(TWSTA)); \
+}
+
+/*
+ * send stop condition without waiting and with(out) acknowledge bit
+ */
+#define twi_sendStop()                                           \
+{                                                                \
+  TWCR |= _BV(TWINT) | _BV(TWSTO) | ((twi_isSlave)?_BV(TWEA):0); \
+}
+
+#if defined(TWI_LOG_ON)
+
+  typedef struct {
+    uint32_t     starts;          // common sends (re)start conditions and ACK recieved
+    uint32_t     tx;              // common successfull transmitted bytes at start CPU
+    uint32_t     rx;              // common successfull recieved bytes
+    uint32_t     err_nack;        // errors not nack for all data situations
+    uint32_t     err_slarw;       // errors not address ACK in all modes
+    uint32_t     err_lost;        // errors lost bus for all: master RX, TX modes AND Slave TX mode
+  } Twi_Statistics;
+  #define ptrTwiStatistics(p)    ((Twi_Statistics *)(p))
+  TwiStatistics   twi_log;        // statistic log for ISR state controller
+
+#endif
+
+// ========================= twi.c ========================= //
+
+// for Master state controller:
+volatile uint8_t         twi_master;            // status for TWI master @see TWI_STATE_xx
+volatile uint8_t         twi_slawr;             // address for connect (slaw, slar) preshifted and with R/W bit
+volatile uint8_t         twi_isSlave;           // =1 if may works as slave too. Я ещё и слушать могу.. Отправлять TWEA?
+volatile uint8_t        *twi_masterCurrent;     // ptr to current byte for send/recieve buffer
+volatile uint8_t         twi_mtxCount;          // what count master will be send
+volatile uint8_t         twi_mrxCount;          // what count master will be recieve into twi_masterBuffer too!
+uint8_t                  twi_repStart;          // how much restarts can we do if Master Recieve Mode read data NACK
+uint8_t                 *twi_masterBuffer;      // ptr to start buffer for send/recieve buffer size=max(twi_mtxCount,twi_mrxCount)!
+// for Slave state Controller:
+volatile uint8_t         twi_slave;             // status for TWI slave
+volatile uint8_t        *slv_Current;           // pointer to current byte in slaveBuffer
+volatile uint8_t         slv_rxCount;           // count byte what slave
+volatile uint8_t         slv_txCount;
+uint8_t                 *slv_rxBuffer;
+uint8_t                 *slv_txBuffer;
+
+
+/**
+ * Консистентное чтение состояния автомата из программы
+ */
+uint8_t getSlaveState()
+{
+  uint8_t       _sreg = SREG;
+  uint8_t      _state;
+
+  cli();
+  _count = twi_slave;
+  SREG = _sreg;
+
+  return _state;
+}
+
+/**
+ * @param freq It can set speed in herz:
+ * 1_000_000 .. 30_400 => TWPS1,0 = 0, divider =  0
+ *    30_399 ..  7_782 => TWPS1,0 = 1, divider =  4
+ *     7_781 ..  1_956 => TWPS1,0 = 2, divider = 16
+ *     1_955 ..    492 => TWPS1,0 = 3, divider = 64
+ */
+uint8_t twi_setSpeed(uint32_t freq)
+{
+  uint16_t count = ((uint16_t)((F_CPU / freq)-16))>>1;
+  uint8_t  shift = 0;
+
+  while( count>255 ) { count>>=2; shift++; }
+  if( shift > 3 ) { return TWI_SPEED_ERROR; }
+
+  TWSR = (TW_STATUS) | shift;
+  TWBR = (uint8_t)count;
+  return 0;
+}
+
+/**
+ * Initialization TWI pin and enable interrupt only
+ * @param ack: =0 temp. disconnected | =1 can reply ACK/NACK answers
+ */
+uint8_t twi_init( uint32_t f, uint8_t ack)
+{
+  uint8_t res = twi_setSpeed(f);
+
+  if( res == 0 ){
+    pinOutHigh(pinSDA);
+    pinOutHigh(pinSCL);
+    TWCR = _BV(TWIE) | ((ack)? _BV(TWEA) : 0);
+  }
+  return res;
+}
+
+/**
+ * Interrupt vector as state-controller for TWI
+ */
+ISR(TWI_vect)
+{
+  switch( twi_getState() ){
+
+// All Master Mode:
+
+    case TWI_MASTER_START: // TW_START    =0x08 sent start condition (Мастер: отправил начало связи. Шина моя.)
+    case TWI_MASTER_NEXT:  // TW_REP_START=0x10 sent repeated start condition: Мастер: отправил повтор адреса (смена режима, повтор)
+#if defined(TWI_LOG_ON)
+      twi_log.starts++;
+#endif
+      twi_masterCurrent = twi_masterBuffer;             // set to start buffer
+      twi_repStart = TWI_MAX_REPEATS                    // set max triing for repeat data when sent and NACK
+      TWDR = twi_slarw;                                 // copy device address and r/w bit to output register and ack
+      twi_go();                                         // and clear interrupt, activate TWI send
+      break;
+
+    case TWI_LOST:         // TW_MT_ARB_LOST=0x38 Master (RX/TX) has lost bus arbitration (Потеря связи этим мастером .. кто-то вылез ишо.)
+#if defined(TWI_LOG_ON)
+      twi_log.err_lost++;
+#endif
+     twi_master = TWI_STATE_LOST;                              // Сообщаем наверх текущий статус.
+      break;
+
+// Master Transmitter Mode:
+
+    case TWI_SLAW_OK:         // TW_MT_SLA_ACK =0x18 slave receiver acked address (Адресат есть и готов к приему: ACK)
+      twi_current = twi_masterBuffer;
+
+    case TWI_MASTER_WRITE_OK: // TW_MT_DATA_ACK=0x28 slave receiver acked data (Данные от мастера получены успешно)
+      if( twi_mtxCount-- ){                             // if not end transmit:
+#if defined(TWI_LOG_ON)
+      twi_log.tx++;
+#endif
+        TWDR = *(twi_masterCurrent++);                  // .. send current byte, store next pointer
+        twi_go();                                       // .. clear interrupt, activate TWI send
+      } else if( twi_master == TWI_STATE_MTXRX ) {
+        twi_sendStart(twi_slarw>>1, TW_READ);           // .. Oops! we will be read after wrote
+      } else {
+        twi_master = TWI_STATE_OK;
+        twi_sendStop();                                 // .. Tx is ended, send stop condition
+      }
+      break;
+
+    case TWI_SLAW_ERR: // TW_MT_SLA_NACK=0x20 address sent, nack received (Ой, адресата нет или он не готов к приему: NOT_ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.err_slarw++;
+#endif
+      twi_master = TWI_STATE_NOTSLA;                     // молчит адресат.. выходим из передачи.
+      twi_sendStop();
+      break;
+
+    case TWI_MASTER_WRITE_ERR: // TW_MT_DATA_NACK=0x30 data sent, nack received (оттуда: "Мастер, я нифига не понял..": NOT_ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.err_nack++;
+#endif
+      if( twi_repStart-- ){                             // Повторяем попытку заданное число раз.
+        TWDR = (--twi_masterCurrent)++;
+        twi_go();
+      } else {
+        twi_master = TWI_STATE_ERRDATA;                  // глухняк.
+        twi_sendStop();
+      }
+      break;
+
+// Master Receiver Mode:
+
+    case TWI_SLAR_OK: // TW_MR_SLA_ACK=0x40 address sent, ack received (Адресат есть и готов к передаче: ACK)
+      twi_current = twi_masterBuffer;
+      twi_go();
+      break;
+
+    case TWI_SLAR_ERR: // TW_MR_SLA_NACK=0x48 address sent, nack received (Ой, адресата нет или он не готов к передаче: NOT_ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.err_slarw++;
+#endif
+      twi_master = TWI_STATE_NOTSLA;                     // Не хочет адресат отдавать байтики или нет его.
+      twi_sendStop();
+      break;
+
+    case TWI_MASTER_READ_OK: // TW_MR_DATA_ACK=0x50 data received, ack sent (Данные пришли: ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.rx++;
+#endif
+      *(twi_current++) = TWDR;                          // store byte into buffer
+      if( twi_mrxCount-- ) { twi_go(); }                // next read
+      else {
+        twi_master = TWI_STATE_OK;                       // read is ended
+        twi_sendStop();
+      }
+      break;
+
+    case TWI_MASTER_READ_ERR: // TW_MR_DATA_NACK=0x58 data received, nack sent (Мастер: "Эй, ты чего прислал?": NOT_ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.err_nack++;
+#endif
+      twi_master = TWI_STATE_ERRDATA;                    // stop read. Не факт, что надо принимать далее. Я - Мастер.
+      twi_sendStop();
+      break;
+
+// Slave Receiver Mode:
+
+    case TWI_FORALL_LISTEN:      // TW_SR_GCALL_ACK         =0x70 addressed generally, returned ack (ведомый: адрес "всем", готов слушать, отправляю ACK)
+    case TWI_LOST_FORALL_LISTEN: // TW_SR_ARB_LOST_GCALL_ACK=0x78 lost arbitration, returned ack (Потеря связи как мастер, получен адрес "всем", слушаю: ACK)
+
+    case TWI_FORME_LISTEN:       // TW_SR_SLA_ACK           =0x60 addressed, returned ack (ведомый: обнаружен мой адрес, слушаю, отправляю ACK)
+    case TWI_LOST_FORME_LISTEN:  // TW_SR_ARB_LOST_SLA_ACK  =0x68 lost arbitration, returned ack (Потеря связи как мастер, получен мой адрес, слушаю: ACK)
+      twi_slave = TWI_STATE_LISTEN;
+      twi_slvCurrent = twi_slaveBuffer;
+      twi_slvCount = 0;
+      twi_goACK();
+      break;
+
+    case TWI_FORALL_READ_OK: // TW_SR_GCALL_DATA_ACK=0x90 data received generally, returned ack (ведомый: получил байт для всех отправляю ACK)
+    case TWI_FORME_READ_OK:  // TW_SR_DATA_ACK=0x80 data received, returned ack (ведомый: получил байт данных, отправляю ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.rx++;
+#endif
+      twi_slvCurrent++ = TWDR;
+      twi_slvCount++;
+      twi_goACK();
+      break;
+
+    case TWI_FORALL_READ_ERR: // TW_SR_GCALL_DATA_NACK=0x98 data received generally, returned nack (ведомый: "пришел кривой байт всем", отправляю NOT_ACK)
+    case TWI_FORME_READ_ERR:  // TW_SR_DATA_NACK=0x88 data received, returned nack (ведомый: "пришел кривой байт", отправляю NOT_ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.err_nack++;
+#endif
+      break;
+
+    case TWI_STOP: // TW_SR_STOP=0xA0 stop or repeated start condition received (Мастер: конец передачи; ведомый: получил конец передачи, отправляю ACK)
+      twi_slave = TWI_STATE_OK;
+
+      break;
+
+// Slave Transmitter Mode:
+
+    case TWI_FORME_ASK:      // TW_ST_SLA_ACK=0xA8 addressed, returned ack (ведомый: обнаружен мой адрес, спрашивают, отправляю ACK)
+    case TWI_LOST_FORME_ASK: // TW_ST_ARB_LOST_SLA_ACK=0xB0 arbitration lost, returned ack (Потеря связи как мастер, получен мой адрес, ща как свистну! ACK)
+      break;
+
+    case TWI_FORME_ANSWER:   // TW_ST_DATA_ACK=0xB8 byte sent, ack returned (ведомый: свистнул, меня услышали, получил ACK)
+#if defined(TWI_LOG_ON)
+      twi_log.tx++;
+#endif
+      TWDR = twi_current++;
+      twi_count++;
+      twi_go();
+      break;
+
+    case TWI_FORME_ANSWER_ERR:  // TW_ST_DATA_NACK=0xC0 received nack, we are done (ведомый: передал, меня не поняли, получил NOT_ACK)
+    case TWI_FORME_ANSWER_LAST: // TW_ST_LAST_DATA=0xC8 received ack, but we are done already! (ведомый: (если TWEA=0) это последний байт, меня услышали, получил ACK)
+      twi_go();
+      break;
+
+// Common states:
+
+    case TWI_EMPTY: // TW_NO_INFO=0xF8 no state information (статус нерелевантен - ничем не занят)
+      break;
+
+    case TWI_ERROR: // TW_BUS_ERROR=0x00 bus error, illegal stop/start (ошибка формата протокола связи .. чё попало.)
+      twi_sendStop();
+      break;
+  }
+}
+
